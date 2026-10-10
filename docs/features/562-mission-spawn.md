@@ -1,10 +1,10 @@
 # 562 — Missions as containers: missions without a crew, roles added and removed while they run
 
 > Tracking issue: [#562](https://github.com/yicheng47/runner/issues/562). Priority: P1.
-> Status: spec under review on `feat/562-missions-as-containers`. Code follows once the open decisions below are settled; the app phase is designed first.
+> Status: Phase 1, mission crews, is settled and is the fix for [#863](https://github.com/yicheng47/runner/issues/863); it ships on its own as a patch release. Phases 2 to 4 are refined in this spec before their work starts, and the app phase is designed first.
 > Design: `design/specs/562-mission-spawn.pen`, drawn on `main` before Phase 4, together with the Start mission dialog of [849](./849-start-mission-modal.md).
 > Identity: a caller is the person at the app or a roster handle, never a location ([648](./archive/648-runner-cli.md) decision 7).
-> Related: [704](./704-session-send.md), `runner session send`, the terminal layer beside this coordination layer. Direct chats stay off the bus. [#863](https://github.com/yicheng47/runner/issues/863), the crew-edit roster bug this design fixes for new missions.
+> Related: [704](./704-session-send.md), `runner session send`, the terminal layer beside this coordination layer. Direct chats stay off the bus. [#863](https://github.com/yicheng47/runner/issues/863), the crew-edit roster bug that Phase 1 fixes.
 > Rewritten 2026-10-10 against the `runnerd` code, after Jason set the direction: a crew is not a prerequisite for a mission, a mission can start from a single role, and roles can be added to or removed from a running mission when needed. Jason chose the same day to give each mission its own crew row (one `crews` table, kind `template` or `mission`, no UI rename) over a separate mission-owned slot model. The 2026-09-18 draft's lead verbs (`runner spawn`, `ps`, `stop`) and outside seats move to Follow-ups; they build on this.
 
 ## Motivation
@@ -49,7 +49,7 @@ Most of the runtime machinery already works per session and per handle; a missio
 | Event log, events, env | `crews/<crew_id>/missions/<mission_id>/events.ndjson`; `crew_id` on every envelope; `RUNNER_CREW_ID` on every session. | Unchanged; the id is the mission crew's. |
 | Prompts | The lead prompt names the crew and splices its `system_prompt_addendum`, read from the crew row again at re-mount. | Unchanged; the mission crew holds its own copy, so a later template edit does not change a running lead's prompt. |
 | Crew lists | Every crew is listed. | Lists, counts and member previews filter to `kind = template`. |
-| Missions of a crew | `missions.crew_id = <crew>`. | `runner mission list --crew <name>`, the only caller that filters by crew, matches the mission crew's name, copied from the template at start, plus missions started before this change that still point at the template directly. |
+| Missions of a crew | `missions.crew_id = <crew>`. | `runner mission list --crew <name>`, the only caller that filters by crew, matches the mission crew's name, copied from the template at start or by the upgrade migration. |
 | Session spawn | `register_mission_session` then `complete_mission_session_spawn`, once per slot; nudges queue until the PTY is live. | Ready for one new slot. |
 | Router routing | `session_by_handle` is a map under the router's state lock; `register_sessions` adds entries at any time. | Ready. |
 | Router roster | `LaunchInputs.roster` is fixed at mount; broadcast nudges walk it and the lead's Restart prompt lists it. | Needs add and remove. |
@@ -61,12 +61,12 @@ Most of the runtime machinery already works per session and per handle; a missio
 
 ### In scope
 
-- **Schema.** `crews.kind` (`template` or `mission`, default `template`, a free string checked in code). Slots are unchanged: who added a role is on its `role_joined` event, and removing a role deletes its slot. Existing crews are template crews; nothing is backfilled.
+- **Schema.** `crews.kind` (`template` or `mission`, default `template`, a free string checked in code). Slots are unchanged: who added a role is on its `role_joined` event, and removing a role deletes its slot. Existing crews become template crews, and existing missions are migrated as below.
 - **Start from a crew.** In the start transaction, `mission_start` creates a mission crew with the template's name and `system_prompt_addendum`, copies each slot with its role, handle, position, lead flag and runtime, model, effort and speed overrides, and points the mission at it. The spawn loop, prompts, router, bus and `roster.json` then read the mission crew exactly as they read a crew today.
 - **Start from roles.** `mission_start` takes exactly one of `crew_id` or `roles: [{ role, handle?, lead, runtime?, model?, effort? }]` with exactly one lead. A roles start creates a mission crew with an empty name and no addendum; the mission header, summaries and the lead prompt leave an empty crew name out.
 - **Keeping the kinds apart.** `repo::crew` listing, counting and member-preview queries filter to `kind = template`, which covers the crew page, the pickers, `crew_list_all` and `runner crew list`. The crew page's slot operations (`ops::slot::create`, `update`, `delete`, `set_lead`, `reorder`) refuse a mission crew. `runner mission list --crew` matches by name as described above.
-- **Deletion.** Deleting a mission deletes its mission crew and that crew's slots and directory. Deleting a template crew never touches the mission crews copied from it, so those missions survive; missions from before this change that point at the template directly keep today's rule.
-- **Missions started before this change.** They keep pointing at their template crew and are not migrated. #863's guard, refusing slot edits on a template crew while one of its missions is running, protects them.
+- **Deletion.** Deleting a mission deletes its mission crew and that crew's slots and directory. Deleting a template crew never touches the mission crews copied from it, so its missions survive; today's refusal while a crew has unarchived missions, and the deletion of its archived missions' rows, go away.
+- **Existing missions, migrated at upgrade.** Once, at daemon start and before any router mounts, every mission whose crew is still a template crew gets its own mission crew: the template's name and addendum, and one slot for each slot its sessions use, copied from that slot, or rebuilt from the session's role and its `roster.json` handle when #863 already deleted the slot. A mission without sessions gets a copy of the template's current slots. Its sessions' `slot_id` is repointed to the copies, and its directory moves from `crews/<template>/missions/<id>/` to `crews/<mission crew>/missions/<id>/`. Archived missions are migrated too, so afterwards every mission has a mission crew and no code path treats a mission's crew as a template. The step runs where an update already restarts every session, and resuming a session rewrites its `runner` shim from the mission's crew id (`session/manager/spawn.rs`), so agents pick up the new `RUNNER_CREW_ID` and `RUNNER_EVENT_LOG` without a crew-edit guard. It is idempotent: a mission whose crew is already a mission crew is skipped.
 - **Add a role.** `mission_add_role(mission_id, { role, handle?, runtime?, model?, effort?, task? })`. It refuses unless the mission is running, not archived and has a mission crew. It picks the handle with the crew page's rule unless one is given, treating the handles of roles removed earlier in the mission, read from its `role_removed` events, as taken (`suggest_slot_handle` and `slot_handle_error` move from `runner-app`'s `surfaces/crews/logic.rs` into `runner-core` so the daemon and the modal share them), inserts the slot into the mission crew, adds the handle to the router's roster and session map and to the bus with an inbox that starts at its join event, rewrites `roster.json`, appends a `role_joined` signal and a broadcast `message` from `runner` that introduces the newcomer to the team and the team to the newcomer, adds `task` as a directed message, then spawns through the existing per-slot path with the worker first turn.
 - **Remove a role.** `mission_remove_role(mission_id, handle)`. It refuses the lead and an unknown or already-removed handle. It stops the slot's session with #542's Stop, deletes the slot, removes the handle from the router's roster (broadcasts skip it, `--to` refuses it) and from the bus's projection, rewrites `roster.json`, and appends a `role_removed` signal and a `runner` broadcast that the agent left the mission. A re-mount rebuilds the smaller roster from the remaining slots. The session's row stays as the mission's history; `sessions.slot_id` has no foreign key and nothing reads that slot afterwards.
 - **Router and bus.** `LaunchInputs.roster` moves behind the router's state lock with add and remove; broadcast nudges and the lead's Restart prompt read the current roster. The bus gains add-handle and remove-handle control messages handled on its consumer thread, so a join or leave is ordered exactly against the log it projects.
@@ -83,7 +83,6 @@ Each has a recommendation; the spec assumes it until Jason decides otherwise.
 3. **The lead is fixed for the mission's life.** Removing or changing the lead is not in this delivery.
 4. **No roster cap for the person.** A cap arrives with the lead's spawn verb, where an agent could loop.
 5. **Add and remove are for the person only** until the lead's verbs land; a mission agent calling them is refused.
-6. **Missions started before this change are not migrated** to mission crews; #863's guard covers them until they end.
 
 ### Out of scope
 
@@ -95,13 +94,14 @@ Each has a recommendation; the spec assumes it until Jason decides otherwise.
 
 ## Implementation Phases
 
-Phases 1 to 3 are daemon and CLI work and can land before any UI. Each phase is a commit that builds and passes its tests. Phase 1 changes nothing visible and fixes #863 for every new mission, so it can ship on its own.
+Phases 1 to 3 are daemon and CLI work and can land before any UI. Each phase is a commit that builds and passes its tests. Phase 1 changes nothing visible and fixes #863 for new and existing missions alike; it ships on its own, as a patch release, and closes #863.
 
-### Phase 1 — mission crews
+### Phase 1 — mission crews (fixes #863)
 
 - Migration `0026_mission_crews.sql`: `crews.kind`.
-- `mission_start` from a crew creates and fills the mission crew; `repo::crew` listing queries filter by kind; slot operations refuse mission crews; `mission list --crew` matches by name; mission and crew deletion as above; #863's guard for missions that still point at a template.
-- Tests: a started mission's crew is a mission crew with the template's name, addendum and slots, overrides included; the crew page, pickers, counts and `runner crew list` never show it; editing or deleting a template changes no running mission, also after a re-mount; listing a template's missions finds both new and pre-change missions; deleting a template keeps its new missions; deleting a mission removes its mission crew; a slot edit on a template with a running pre-change mission is refused.
+- The upgrade step that gives every existing mission its own mission crew, repoints its sessions and moves its directory, run once at daemon start before any router mounts.
+- `mission_start` from a crew creates and fills the mission crew; `repo::crew` listing queries filter by kind; slot operations refuse mission crews; `mission list --crew` matches by name; mission and crew deletion as above.
+- Tests: a started mission's crew is a mission crew with the template's name, addendum and slots, overrides included; the crew page, pickers, counts and `runner crew list` never show it; editing or deleting a template changes no running mission, also after a re-mount; the migration gives a running, a stopped and an archived mission each its own mission crew with the slots their sessions use, including a session whose slot #863 already deleted, moves each directory, and changes nothing when run twice; a migrated running mission resumes after the restart and its agents post through the rewritten shim; listing a template's missions finds new and migrated ones; deleting a template keeps its missions; deleting a mission removes its mission crew.
 
 ### Phase 2 — add and remove while running
 
@@ -122,7 +122,7 @@ Phases 1 to 3 are daemon and CLI work and can land before any UI. Each phase is 
 
 ## Verification
 
-- [ ] A mission started from a crew runs as before, on its own mission crew, and missions started before the change resume, restart and replay unchanged.
+- [ ] A mission started from a crew runs as before, on its own mission crew, and missions started before the upgrade are migrated to their own mission crews, then resume, restart and replay unchanged.
 - [ ] Editing or deleting a template crew never changes a running mission, including after a daemon restart, and mission crews never appear on the crew page, in pickers or in `runner crew list`.
 - [ ] A mission started from one role runs end to end: the lead gets the goal and posts with `runner msg post`.
 - [ ] A mission started from several roles has exactly one lead and the roster that was picked.
