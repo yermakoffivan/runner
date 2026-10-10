@@ -1,133 +1,124 @@
-# 562 — Missions as containers: spawn roles into a running mission
+# 562 — Missions as containers: missions without a crew, roles added and removed while they run
 
-> Tracking issue: [#562](https://github.com/yicheng47/runner/issues/562)
-> Priority: P1 (raised from P3 on 2026-09-22), milestone 0.17, its headline (moved from 0.13 to 0.15 on 2026-10-07, when 0.13.x became the runnerd follow-through line, and renumbered 0.17 on 2026-10-10, when Cursor shipped as 0.15.0); [704](./704-session-send.md), its terminal layer, comes first in 0.16. It needs a minor release because it migrates every mission's roster.
-> Status: planned, design first.
-> Design: `design/specs/562-mission-spawn.pen`, frames to draw before Phase 4.
-> Identity decided with Jason on 2026-09-18 ([648](./archive/648-runner-cli.md) decision 7): a caller is the person at the app or a roster handle, never a location. 648 owns the `from` handle on the socket; this spec owns the seats an outside agent takes.
-> Related: [704](./704-session-send.md) (2026-09-23), `runner session send` and `session wait`: the terminal layer beside this coordination layer, after Orca's split between `terminal send` and `orchestration`. Direct chats stay off the bus; 704 is typed input with no log, and a chat that needs a durable, attributed exchange uses this spec's missions and seats.
-> Rewritten 2026-09-18 from "Add runners to a running mission" (2026-09-11). The first draft grew a crew mission's roster from the rail or a lead signal. This version makes the mission the container that owns its roster, keeps the crew as one way to seed it, lets a mission start from a single role, and gives the lead the verbs to spawn roles and follow their state.
+> Tracking issue: [#562](https://github.com/yicheng47/runner/issues/562). Priority: P1.
+> Status: spec under review on `feat/562-missions-as-containers`. Code follows once the open decisions below are settled; the app phase is designed first.
+> Design: `design/specs/562-mission-spawn.pen`, drawn on `main` before Phase 4, together with the Start mission dialog of [849](./849-start-mission-modal.md).
+> Identity: a caller is the person at the app or a roster handle, never a location ([648](./archive/648-runner-cli.md) decision 7).
+> Related: [704](./704-session-send.md), `runner session send`, the terminal layer beside this coordination layer. Direct chats stay off the bus.
+> Rewritten 2026-10-10 against the `runnerd` code, after Jason set the direction: a crew is not a prerequisite for a mission, a mission can start from a single role, and roles can be added to or removed from a running mission when needed. The 2026-09-18 draft's lead verbs (`runner spawn`, `ps`, `stop`) and outside seats move to Follow-ups; they build on this.
 
 ## Motivation
 
-A mission's roster is fixed the moment it starts. `ops::mission::start` snapshots the crew's slots into `roster.json`, one session is spawned per slot, and the router and bus hold the roster immutably. When the lead finds mid-flight that the task splits three ways, or needs a reviewer the crew never had, the only move is to stop, edit the crew, and start over, losing every conversation.
+A mission can only start from a crew today. `ops::mission::start` refuses a crew with no slots or no lead, every session is spawned from one of the crew's slots, and the roster cannot change until the mission ends. Two everyday needs fall through:
 
-The crew also sits in front of every delegation. The pattern Jason uses daily (a Claude Code session plans, a Codex agent implements) ran until 0.11 from an external session over MCP, and from 0.11.0 runs over the `runner` CLI, and needed a one-slot crew ("codex solo") just so one agent could hand work to another. A crew of one is a spawn with setup in front of it.
+- **One agent handing work to another.** Jason's daily pattern (a Claude Code session plans, a Codex agent implements) needs a one-slot crew ("codex solo") just to start a mission. A crew of one is setup in front of a single role.
+- **A mission that needs another pair of hands.** When the task splits three ways, or a reviewer is needed that the crew never had, the only move is to stop the mission, edit the crew and start over, losing every conversation. The reverse, letting an agent go once its part is done, is not possible either.
 
-Delegation across runtimes is the lane nobody else covers: Claude Code's subagents spawn Claude, Codex's spawn Codex. A lead that picks a role (runtime, model, effort and brief already set) for each piece of work is also the token-subscription positioning working without the human choosing each time.
+Crews stay. A repeatable shape, such as coder plus reviewer, needs a fixed template so runs can be compared. The crew becomes one way to fill a mission, not the only way in.
 
-Crews stay. A repeatable shape (coder plus reviewer, or #630's re-runnable jobs) needs a fixed roster so runs can be compared. The crew becomes one way to fill a mission, not the only way in.
+## How it works today
+
+Most of the runtime machinery already works per session and per handle. What ties a mission to its crew is the data model, the log location, and two lists fixed when the mission mounts.
+
+| Layer | Today | Ready for a changing roster? |
+| --- | --- | --- |
+| Database | `missions.crew_id` is `NOT NULL` with `ON DELETE CASCADE` (`0001_init.sql`). `slots.crew_id` is `NOT NULL`, so a mission has no slots of its own; `sessions.slot_id` points at a crew slot. | No: the mission has no roster of its own. |
+| Start | `ops::mission::start` copies nothing. It checks the crew's slots, writes `roster.json` from them, and spawns one session per slot. | No: needs a crew with a lead. |
+| Re-mount and app | After a daemon restart, `ensure_mission_router_mounted` rebuilds the router from the crew's *current* slots (`slot::list(crew_id)`), and so do `validate_roster_handle`, `post_message` and the app's `mission_workspace/attach.rs`. | No, and it is a latent bug (below). |
+| Event log | `crews/<crew_id>/missions/<mission_id>/events.ndjson` (`event_log::mission_dir`). The mission's scratch directory with per-slot `runner` shims is already `missions/<mission_id>/`. | No: the path needs a crew. |
+| Events and env | Every event envelope carries `crew_id`; every mission session gets `RUNNER_CREW_ID`. | No: both assume a crew. |
+| Session spawn | `register_mission_session` then `complete_mission_session_spawn`, once per slot; inbox nudges queue until the new PTY is live. | Yes: works for one new slot. |
+| Router routing | `session_by_handle` is a map under the router's state lock; `register_sessions` adds entries at any time, which Resume already uses. | Yes. |
+| Router roster | `LaunchInputs.roster` is fixed at mount. Broadcast nudges walk it, and the lead's Restart prompt lists it. | No: fixed list. |
+| Bus | `BusState.handles` is fixed at mount ("Adding handles after mount is not supported in MVP"); it decides whose inbox each message is projected into. | No: fixed list. |
+| CLI | Rereads `roster.json` on every call to validate `--to`. | Yes, once the file is rewritten on change. |
+| Per-session lifecycle | #542's Stop, Resume and Restart work on one session. | Yes. |
+| Prompts | The lead's prompt names the crew and splices the crew's `system_prompt_addendum`, both read from the crew row again at re-mount. | No: needs a crew row that still exists. |
+
+**Latent bug.** Because the running roster is read from the crew's current slots, editing a crew while one of its missions runs changes that mission's roster at the next re-mount, while `roster.json` and the live sessions keep the old one. Deleting a crew slot leaves its mission session pointing at a slot that no longer exists. Mission-owned slots fix this as a side effect.
 
 ## Model
 
-- **Mission**: a container with one event log, a cwd, a goal, a roster of slots, and exactly one lead. The mission owns its roster.
-- **Crew**: a template. Starting a mission from a crew copies the crew's slots into the mission. Editing the crew afterwards never touches a running mission.
-- **Role-seeded mission**: a mission started from one role, which becomes the lead. Its roster grows by spawning.
-- **Spawn**: add a slot to a running mission and start its session. The lead, the human, or an outside caller through the `runner` CLI can spawn.
-- **Caller**: the person at the app, `human` on the bus, or a handle in the mission's roster. A seat is a roster entry and does not need a Runner-spawned session behind it. An outside agent that drives a mission takes a seat, and from then on its posts, spawns, stops and answers carry that handle, and workers reach it with `--to <handle>` like any crewmate.
-- **Direct chats** stay off the bus.
+- **Mission**: a container with one event log, a cwd, a goal, a roster of mission slots, and exactly one lead. The mission owns its roster.
+- **Crew**: a template. Starting a mission from a crew copies its slots into mission slots. Editing or deleting the crew afterwards never touches the mission, which keeps the crew's id only as a record of where it came from.
+- **Starting without a crew**: pick one or more roles and mark one as lead. A single role is a one-agent mission.
+- **Add a role**: insert a mission slot into a running mission and start its session. An added role is always a worker.
+- **Remove a role**: stop the slot's session and take it off the roster. Its messages stay in the feed. The lead cannot be removed.
 
-Vocabulary: **crew slot** (a row the crew page edits) and **mission slot** (a row one mission owns). No new nouns. The vision's "Mission: one live activation of a crew" becomes "one live run of a roster, seeded from a crew or a role".
+Vocabulary: **crew slot** (a row the crew page edits) and **mission slot** (a row one mission owns). No new nouns. The vision's "Mission: one live activation of a crew" becomes "one live run of a roster, seeded from a crew or from roles".
 
 ## Scope
 
 ### In scope
 
-- **Mission-owned roster** (backend). `slots` gains a nullable `mission_id` and `crew_id` becomes nullable, with a check that exactly one is set. Crew slots keep `mission_id IS NULL` and are what the crew page lists. `mission_start` copies the crew's slots into mission slots in the same transaction that creates the mission, and each session points at its mission slot. Handles are unique per crew among crew slots and per mission among mission slots (the `UNIQUE (crew_id, slot_handle)` and `UNIQUE (crew_id, position)` constraints become partial indexes). A mission slot keeps the `runtime_override`, `model_override`, and `effort_override` columns and gains `added_by TEXT NULL` (`NULL` for seeded slots, otherwise `human` or the lead's handle). `mission_delete` removes the mission's slots. The migration backfills every existing mission: it copies the slot each of its sessions points at into a mission slot and repoints `sessions.slot_id`, so every roster read has one path, `slot::list_for_mission`.
-- **The spawn op.** `ops::mission::mission_spawn(mission_id, SpawnInput { role: RoleRef (id or handle), slot_handle: Option<String>, runtime: Option<String>, model: Option<String>, effort: Option<String>, task: Option<String>, requested_by: Requester })`, where `Requester` is `Human` or `Slot(handle)`. It refuses unless the mission is running and not archived; a paused mission is fine, and the new slot then spawns alone. It resolves the role and picks the handle: `slot_handle`, else the role's handle, suffixed `-2`, `-3`… past taken handles as `suggest_slot_handle` does. Then it inserts the mission slot and registers the session (`register_mission_session` with the mission cwd, the mission's permission mode, the grid hint size, and `compose_worker_first_turn` checked by `ensure_first_turn_fits`). Then it adds the member to the router (`Router::add_member` plus `register_pending_sessions`) and to the bus (`BusRegistry::add_handle`), appends the handle to `roster.json`, and appends the events below. Last, it dispatches the spawn through the mission's pending-cancel flag, so Stop and Archive still abort a slot that has not started yet. A spawned slot is always a worker.
-- **Mutable roster in the router and bus.** `LaunchInputs.roster` moves behind the router's state lock so `add_member` can push a row. A lead Restart after a spawn composes a launch prompt whose `== Your crewmates ==` section lists the new slot. `BusState.handles` gets an add path on the consumer thread (a control message alongside the tick), so the new slot's inbox projects every message from its join event onward and nothing before it. `roster.json` stops being frozen: the CLI already rereads it on every call, so `runner msg post --to <new handle>` validates right after the join. Its entries, today only `{handle, lead}`, gain optional `role` and `runtime` fields for `runner ps`; older sidecars still parse without them.
-- **Join events.** The op appends a `role_joined` signal from the requester (`human` or the lead's handle) with `{handle, display_name, role_handle, role_id, runtime, session_id}`, then a broadcast `message` from `runner`: "@coder-2 (Coder, codex) joined the mission, added by @lead. @coder-2: your lead is @lead; your crewmates are @reviewer. Report back with `runner msg post --to lead`." When `task` is set, a directed `message` from the requester to the new slot carries it verbatim. `message_nudge` already delivers the broadcast to every roster member and queues the new slot's nudges until its PTY is live. `role_joined` is emitted by the app, like `human_question`, so it stays out of `KnownSignalType`.
-- **The lead's verbs** (CLI plus router). Every verb below is lead-only. A worker sender is bounced with a `mission_warning` that points it at `ask_lead`.
-  - `runner spawn <role> [--as <handle>] [--runtime <runtime>] [--model <model>] [--effort <effort>] ["<task>"]` emits a `spawn_role` signal. The router validates the sender and the payload, then hands the request to the core through a new `RouterUiNotifier` method (the router owns no DB and no session manager), and the core runs `mission_spawn` with `requested_by: Slot(lead)`. These cases bounce with a `mission_warning` that the lead sees in its terminal: an unknown role (the warning lists the known role handles, since the lead has no other way to discover them), a taken `--as` handle, an unknown runtime, and a roster already at `MISSION_SPAWN_CAP` (8, a constant, not a setting; the human's path has no cap). The CLI returns at once and prints that the result arrives as the join broadcast or a warning.
-  - `runner ps` folds `roster.json` and the event log, with no IPC. It prints one line per member: handle, role, runtime, state (`starting`, `working`, `idle`, `stopped`, `crashed`), and the time and first line of the member's last message.
-  - `runner stop <handle>` emits a `stop_slot` signal. The core stops that session with the #542 per-slot Stop. The lead cannot stop itself.
-  - The launch prompt's `== Coordination ==` section gains three lines for these verbs. The worker preamble does not mention them.
-- **Role-seeded missions.** `missions.crew_id` becomes nullable. `mission_start` takes exactly one of `crew_id` or `role` (id or handle); a role seeds one mission slot, the lead. A crewless mission keeps its event log in `<app data>/missions/<id>/`, the directory that already holds the mission's scratch files and is removed with the mission (`ops/mission.rs:1270`); `event_log::mission_dir` takes an optional crew. The event envelope's `crew_id` becomes optional: it is omitted for crewless missions, and old logs parse unchanged. The CLI's `RUNNER_CREW_ID` becomes optional, while the other three variables are still required together. The launch prompt uses the mission title where it used the crew name, and a crewless mission has no crew-conventions layer. Deleting a crew keeps its current rule (refused while the crew has non-archived missions).
-- **Outside seats.** A mission can have a lead seat that Runner did not spawn: an outside agent (a Claude Code session at a terminal, a script) that started the mission holds `lead`, and its inbox is `runner mission feed --follow` or `wait`. A worker's `ask_lead` to an outside lead is left on the feed, not injected, and `wait` returns on it; `done` closes the mission from that seat. The command that takes the seat (a flag on `mission start`, or a join verb) is designed with the rest of the verbs in Phase 2. The roster entry has no `session_id`, `runner ps` lists it as `external`, and the human's Add role path is unchanged. This is what 648 reserved `wait` and `done` for.
-- **The human's path** (app). Under the rail's sessions list, a **+ Add role** row shown while the mission is running. It opens an **Add role** modal: the role picker from the crew page's add-slot form, runtime, model and effort options, a handle field pre-filled with the suggested unique handle and validated with `slot_handle_error`, and an optional multi-line **Task**. Add calls the op with `requested_by: Human`. The new card appears at the end of the rail with the starting pill and an "added by @lead" or "added by you" caption. Starting a mission gains a choice between a crew and a role, and a role's detail page gains **Start mission**.
-- **Feed rows.** `role_joined` renders as a signal row on the requester's avatar: "@lead · spawned @coder-2 (Coder, codex)". `slot_exited` renders as a warning row when the outcome is `crashed` and a muted row otherwise. `spawn_role` and `stop_slot` requests, and their bounces, render through the existing signal and warning rows.
-- **Socket tools and their commands.** Runner's MCP integration is gone by then ([648](./archive/648-runner-cli.md) decision 8), so these are tools on the CLI's socket, each with a command. `mission_spawn(mission_id, role, as?, runtime?, model?, effort?, task?)` beside `mission_start`, which maps to `requested_by: Human`. `mission_start` accepts `role` as an alternative to `crew_id`, so an outside session can start a one-role mission and spawn into it.
-- **Per-slot lifecycle.** #542's Stop, Resume, and Restart work on a spawned slot unchanged, resolved through `sessions.slot_id`. The mission-wide Resume respawns spawned slots with the rest, and an app restart rebuilds the router from `list_for_mission`.
+- **Mission-owned slots.** `slots` gains a nullable `mission_id` and `crew_id` becomes nullable, with a check that exactly one is set. Crew slots keep `mission_id IS NULL` and are all the crew page lists. Mission slots keep the runtime, model, effort and speed overrides and gain `added_by` (`NULL` when seeded at start, otherwise `human`) and `removed_at`. Handles and positions are unique per crew among crew slots and per mission among mission slots, as partial unique indexes.
+- **Missions without a crew.** `missions.crew_id` becomes nullable with `ON DELETE SET NULL`, so deleting a crew keeps its missions. The lead prompt's crew name and addendum are snapshotted onto the mission at start (`missions.roster_name`, `missions.prompt_addendum`): a crew-seeded mission takes the crew's name and addendum, a crewless one takes its title and none. Re-mount and Restart read the snapshot, never the crew row.
+- **Migration and backfill.** One migration rebuilds `slots` and `missions`. For each mission it creates one mission slot per mission session, copied from the crew slot the session points at, or from the session's role and its `roster.json` handle when that crew slot is gone, and repoints `sessions.slot_id`. It fills the prompt snapshot from the crew row.
+- **One log location.** Every mission keeps its log and `roster.json` in `missions/<mission_id>/`, next to its shims. `event_log::mission_dir` drops its crew argument. Existing directories under `crews/<crew_id>/missions/` are moved once, idempotently, at daemon start before any router mounts. A daemon update already restarts every session, so resumed sessions get shims with the new `RUNNER_EVENT_LOG`.
+- **Events and env without a crew.** The envelope's `crew_id` becomes optional: omitted for crewless missions, and old logs parse unchanged. `RUNNER_CREW_ID` is set only for crew-seeded missions, and the CLI stops requiring it.
+- **Start from a crew or from roles.** `mission_start` takes exactly one of `crew_id` or `roles: [{ role, handle?, lead, runtime?, model?, effort? }]` with exactly one lead, and copies either into mission slots in the start transaction. Everything after the copy (prompt composition, spawn loop, router and bus mount) reads mission slots.
+- **Add a role.** `mission_add_role(mission_id, { role, handle?, runtime?, model?, effort?, task? })`. It refuses unless the mission is running and not archived. It picks the handle with the crew page's rule unless one is given (`suggest_slot_handle` and `slot_handle_error` move from `runner-app`'s `surfaces/crews/logic.rs` into `runner-core`, so the daemon and the modal share them), inserts the mission slot, adds the handle to the router's roster and session map and to the bus with an inbox that starts at its join event, rewrites `roster.json`, appends a `role_joined` signal and a broadcast `message` from `runner` that introduces the newcomer to the team and the team to the newcomer, adds `task` as a directed message, then spawns through the existing per-slot path with the worker first turn.
+- **Remove a role.** `mission_remove_role(mission_id, handle)`. It refuses the lead and an unknown or already-removed handle. It stops the slot's session with #542's Stop, sets `removed_at`, removes the handle from the router's roster (broadcasts skip it, `--to` refuses it) and from the bus's projection, rewrites `roster.json`, and appends a `role_removed` signal and a `runner` broadcast that the agent left the mission.
+- **Router and bus.** `LaunchInputs.roster` moves behind the router's state lock with add and remove; broadcast nudges and the lead's Restart prompt read the current roster. The bus gains add-handle and remove-handle control messages handled on its consumer thread, so a join or leave is ordered exactly against the log it projects.
+- **Protocol and CLI.** The client protocol carries the start, add and remove operations. The `runner` CLI gains `runner mission start --role <role>` (repeatable, `--lead <role>` when more than one), `runner mission add-role <mission> <role> [--as <handle>] [--runtime …] [--model …] [--effort …] [--task …]` and `runner mission remove-role <mission> <handle>`. They act as the person, the identity of a caller without a handle, and are refused from inside a mission session until the lead's verbs exist (Follow-ups).
+- **App.** The Start mission dialog offers a crew or a set of roles (with 849). The mission rail gains **+ Add role** under its sessions while the mission runs, opening a modal with the role picker from the crew page's add-slot form, runtime, model and effort, a handle pre-filled with the suggested unique handle, and an optional task. A worker card's menu gains **Remove from mission**, with a confirmation. The feed renders `role_joined` and `role_removed` rows. The mission header shows a crew only when one seeded the mission.
+- **Docs.** `docs/arch/arch.md` §8 (the roster is mission-owned; `role_joined` and `role_removed`) and §10.2 (the log layout); `docs/product/vision.md` §3 definitions, as in Model.
 
-### What the lead hears without asking
+### Decisions to confirm
 
-The router pushes state changes to the lead, and `runner ps` is the snapshot when the lead wants one. Nothing requires the lead to poll.
+Each has a recommendation; the spec assumes it until Jason decides otherwise.
 
-| Change | How it reaches the lead | Today |
-|---|---|---|
-| A result or report | the worker runs `runner msg post --to lead`; the lead is nudged | built |
-| A worker needs a decision | `ask_lead` is injected | built |
-| A worker joined | the join broadcast | this spec |
-| A spawn failed | a `mission_warning` in the lead's terminal | this spec |
-| A worker went idle without reporting | the router injects "@coder is idle (last message 4m ago)" on a non-lead Busy→Idle transition, unless that worker posted to the lead during the same busy stretch. arch §8.1 documents this handler but `router/handlers.rs::session_status` only records the state | this spec |
-| A worker stopped or crashed | the core appends a `slot_exited` signal from `router` with `{handle, outcome: stopped \| crashed, exit_code, by}`; the router injects "@coder crashed (exit 1)" to the lead unless the lead asked for the stop or the whole mission is stopping. Today `SessionDeliveryEvent::Exited` only drops the outbox (`router/mod.rs:1360`) | this spec |
+1. **A removed role's handle stays reserved in the mission.** Reusing it would merge two agents' history under one name in the feed and in inbox projection. Adding the same role again gets `coder-2`.
+2. **A mission cannot start empty.** It needs a lead to receive the goal. "Create a mission, then assign roles" is: pick the lead role at start, then add the rest.
+3. **Deleting a crew keeps its missions.** Today it deletes the rows of its archived missions and refuses while any is unarchived; afterwards neither applies.
+4. **The lead is fixed for the mission's life.** Removing or changing the lead is not in this delivery.
+5. **No roster cap for the person.** A cap arrives with the lead's spawn verb, where an agent could loop.
+6. **The add and remove commands are for the person only** until the lead's verbs land; a mission agent calling them is refused.
 
 ### Out of scope
 
-- A direct chat becoming a slot. A chat's `RUNNER_*` environment is fixed at spawn (`crates/runner-cli/src/env.rs`), so a running chat never joins a bus as a slot. It drives a mission from outside instead, taking a seat with `--as` and addressing it with `--mission`, which is the outside-seat path above. "Resume this chat as the lead of a new mission" is not needed once that works.
-- Workers spawning (more than one level). Workers ask the lead with `ask_lead`.
-- The lead reading a worker's terminal. Messages are the contract; raw TUI output is noisy and costs tokens.
-- Passing approval waits on to the lead. The human's attention indicator already covers approvals.
-- Removing a slot from a mission, promoting a mission slot into a crew, changing the lead, or a second lead.
-- A confirm gate on the lead's spawns. The feed shows every spawn, per-slot Stop undoes one, and the cap is the guard.
-- Spawning into a completed, aborted, or archived mission, or while the mission's cold-start spawn queue is still running (the request waits for a retry, the same gap #542 left).
+- **The lead's verbs** (Follow-ups): `runner spawn`, `runner ps` and `runner stop` from the lead, idle and crash notices to the lead (`slot_exited`), and outside seats, where an agent outside Runner holds the lead seat. A separate issue once this lands.
+- Saving a mission's roster as a crew.
+- A direct chat joining a mission as a slot. A chat's `RUNNER_*` environment is fixed at spawn; it drives a mission from outside instead.
+- Workers adding or removing roles.
+- Adding to or removing from a completed, aborted or archived mission, or while the mission's cold-start spawn queue is still running.
 
 ## Implementation Phases
 
-### Phase 1 — mission-owned roster and the spawn op
+Phases 1 to 3 are daemon and CLI work and can land before any UI. Each phase is a commit that builds and passes its tests; Phase 1 can ship on its own, since it fixes the crew-edit bug with no visible change.
 
-- Migration `0024_mission_slots.sql`: `slots` rebuilt with a nullable `mission_id` (references `missions(id)` on delete cascade), a nullable `crew_id`, a check that exactly one is set, `added_by`, and partial unique indexes over crew slots and over mission slots. It backfills mission slots from each mission's sessions and repoints `sessions.slot_id`.
-- `repo::slot`: `list_for_crew` filters `mission_id IS NULL`; add `list_for_mission` and `insert_for_mission`. `ops::mission::start` copies the crew's slots. `ensure_mission_router_mounted`, `mission_resume`, and Restart read `list_for_mission`.
-- `ops::mission::mission_spawn`, the mutable roster in `router/mod.rs` (`add_member`), `BusRegistry::add_handle`, the `roster.json` append, and the join events. The comments in `ops/mission.rs` and `crates/runner-cli/src/roster.rs` stop saying the roster is frozen.
-- `mcp/tools/mission.rs`: `mission_spawn`.
-- Tests: the backfill gives every existing session a mission slot with the same handle, role, and overrides; the crew page never lists a mission slot; editing a crew slot does not change a running mission's slot; two missions of one crew can each spawn `@coder-2`; the op refuses a taken handle and a non-running mission; the new session's row carries the worker first turn; the join events land in order and the new slot's inbox holds the broadcast and the task; after an app restart, `reconstruct_from_log` rebuilds a roster that includes the spawned slot.
+### Phase 1 — mission-owned roster and one log location
 
-### Phase 2 — the lead's verbs and what the lead hears
+- Migration `0026_mission_slots.sql`: rebuild `slots` (nullable `crew_id`, `mission_id`, the check, `added_by`, `removed_at`, partial unique indexes) and `missions` (nullable `crew_id` with `ON DELETE SET NULL`, `roster_name`, `prompt_addendum`), with the backfill.
+- `repo::slot`: `list_for_crew` filters `mission_id IS NULL`; add `list_for_mission` and `insert_for_mission`. `ops::mission::start` copies crew slots. Re-mount, `validate_roster_handle`, `post_message`, Resume, Restart and the app's attach read mission slots and the prompt snapshot.
+- `event_log::mission_dir(app_data, mission_id)`, the one-time move, and the shim path; `ops::crew::delete` keeps missions.
+- Tests: the backfill gives every session a mission slot with the same handle, role and overrides, including a session whose crew slot was deleted; the crew page never lists a mission slot; editing or deleting a crew slot changes no running mission, also after a re-mount; a moved log replays; deleting a crew keeps its missions.
 
-- `crates/runner-core/src/model.rs`: `KnownSignalType::{SpawnRole, StopSlot}`. `crates/runner-cli/src/main.rs`: the `spawn`, `ps`, and `stop` commands; `crates/runner-cli/src/help.rs` documents them.
-- `router/handlers.rs`: `spawn_role` and `stop_slot` validation with their bounces, the idle notice with its "posted to the lead during this busy stretch" suppression, and the `slot_exited` injection. `router/prompt.rs`: the three coordination lines.
-- The core appends `slot_exited` when a mission session exits, with the outcome, exit code, and who asked for the stop.
-- The outside seat: the seat-taking command, `wait` (exit 4 on timeout, 648's reserved code), `done`, and `runner ps` listing a seat with no session as `external`. `router/handlers.rs`: `ask_lead` to a seat with no session stays on the feed.
-- `docs/arch/arch.md`: the roster is append-only, §8.1 gains `spawn_role`, `stop_slot`, `role_joined`, and `slot_exited` and states the idle notice as built, and §9 lists the new commands.
-- Tests: `spawn_role` from the lead reaches the notifier, and from a worker it bounces; an unknown role bounces with the role list; the cap bounces the lead but not the human; `runner ps` folds a log with a join, a busy stretch, a message, and a crash into the right five lines; an idle notice is suppressed after a report to the lead and sent without one; a crash injects to the lead, and a `runner stop` exit does not.
+### Phase 2 — add and remove while running
 
-### Phase 3 — role-seeded missions
+- `ops::mission::{mission_add_role, mission_remove_role}`, the router's mutable roster, the bus's add-handle and remove-handle, the `roster.json` rewrite, and the `role_joined` and `role_removed` events.
+- Client protocol operations and the `runner mission add-role` and `remove-role` commands.
+- Tests: join events land in order with the documented payloads; the newcomer's inbox holds the broadcast and the task and nothing earlier; `--to` the newcomer validates right after the join and broadcasts reach it; `--to` a removed handle is refused and broadcasts skip it; removing the lead is refused; a re-mount after a daemon restart rebuilds both changes; two missions of one crew can each add `@coder-2`.
 
-- Migration `0025_crewless_missions.sql`: `missions.crew_id` becomes nullable.
-- `event_log::mission_dir` with an optional crew; the envelope's optional `crew_id`; `crates/runner-cli/src/env.rs` with an optional `RUNNER_CREW_ID`; `mission_start` taking a crew or a role; `LaunchInputs` without a crew name or addendum; `mission_start` over MCP taking `role`.
-- `docs/product/vision.md`: §3's Mission and Crew definitions and §4.2 as in Model above.
-- Tests: a role-seeded mission writes its log under `missions/<id>/`; its lead's `runner msg post` works without `RUNNER_CREW_ID`; an old log with `crew_id` on every line still replays; deleting a role-seeded mission removes its log directory.
+### Phase 3 — start without a crew
+
+- `mission_start` with `roles`, the optional envelope `crew_id` and `RUNNER_CREW_ID`, and `runner mission start --role`.
+- Tests: a one-role mission runs end to end with its log under `missions/<id>/`; its lead's `runner msg post` works without `RUNNER_CREW_ID`; a log with `crew_id` on every line still replays; deleting a crewless mission removes its directory.
 
 ### Phase 4 — design, then app
 
-- Draw the frames in `design/specs/562-mission-spawn.pen` and stop for sign-off: the rail with **+ Add role**, the **Add role** modal, a spawned card with its caption, the `role_joined` and `slot_exited` feed rows, and the crew-or-role choice when starting a mission.
-- `crates/runner-app/src/surfaces/mission_workspace.rs`: the row, the modal (reusing the crew page's `AddSlotForm` pieces and `suggest_slot_handle`), the caption, and the feed rows. `app_store.rs`: `role_joined` and `slot_exited` join the `event/appended` refresh list. The new-mission flow and the role detail page gain the role option.
-- Tests: the modal validates handles against the mission roster; the rail renders a spawned session after `session/spawned`; the feed row copy.
-
-### Phase 5 — smoke
-
-- Start a role-seeded mission with a Claude Code lead. The lead runs `runner spawn coder --runtime codex "Implement X"`, the codex slot boots, reads the join broadcast and the task, does the work, and reports with `runner msg post --to lead`; the lead wakes on the nudge.
-- The lead runs `runner ps` while the coder works, then after it finishes, and sees the states change.
-- Kill the coder's process. The lead is told it crashed, and the feed shows the row.
-- The lead runs `runner stop coder`. The lead gets no crash notice, and the rail shows the slot stopped.
-- A worker runs `runner spawn` and is bounced; nothing is spawned.
-- The human adds a reviewer from the rail with a task.
-- An outside Claude Code session at a terminal starts a mission holding the lead seat, spawns a codex coder with a task, `wait`s for its report, and runs `done`; the feed attributes every step to `@lead`, never to the person.
-- Quit and relaunch the app with the mission running: spawned slots are in the rail and resume with the rest.
-- A crew mission started before the migration still resumes with its roster intact.
-- Windows on JASONPC: the human's path and `runner spawn` with a batch-wrapped role.
+- Draw the frames in `design/specs/562-mission-spawn.pen` on `main` and stop for sign-off: the Start mission dialog's crew-or-roles choice (with 849), **+ Add role** and its modal, **Remove from mission** and its confirmation, a card added mid-mission, and the two feed rows.
+- `mission_workspace`: the rail row, the modal (reusing the crew page's add-slot pieces and the shared handle rule), the card menu item, and the feed rows; `app_store.rs` refreshes on `role_joined` and `role_removed`; the Start mission dialog.
+- Tests: the modal validates handles against the mission roster, including removed ones; the rail shows a slot added after `session/spawned` and hides a removed one; feed row copy.
 
 ## Verification
 
-- [ ] The migration gives every existing mission's sessions a mission slot, and pre-migration missions resume, restart, and replay unchanged.
-- [ ] The crew page lists crew slots only, and editing a crew never changes a running mission.
-- [ ] `mission_spawn` updates the router, bus, and `roster.json` before appending events, and spawns through the mission's cancel flag.
-- [ ] `runner msg post --to <new handle>` validates immediately after the join.
-- [ ] The join events land in order with the documented `from` and payloads; the new slot's inbox has the broadcast and the task and no earlier history.
-- [ ] `runner spawn` from the lead spawns. From a worker, with an unknown role, with a taken handle, with an unknown runtime, or at the cap it appends a `mission_warning` and spawns nothing.
-- [ ] `runner ps` reports the right state and last message for every member, including crashed and stopped ones.
-- [ ] The lead is told when a worker goes idle without reporting and when a worker crashes, and is not told about a stop it asked for.
-- [ ] A role-seeded mission runs end to end with its log under `missions/<id>/`.
-- [ ] **+ Add role** is hidden on completed, aborted, and archived missions, and the modal refuses a handle already in the mission roster.
-- [ ] `mission_delete` removes the mission slots and, for a crewless mission, its log directory.
-- [ ] Every post, signal, spawn and stop on the feed is attributed to the person or a roster handle, and an outside agent holding a seat never appears as the person.
+- [ ] Pre-migration missions resume, restart and replay unchanged, with their logs moved to `missions/<id>/`.
+- [ ] Editing or deleting a crew never changes a running mission, including after a daemon restart, and deleting a crew keeps its missions.
+- [ ] A mission started from one role runs end to end: the lead gets the goal, posts with `runner msg post`, and no `RUNNER_CREW_ID` is set.
+- [ ] A mission started from several roles without a crew has exactly one lead and the roster that was picked.
+- [ ] An added role boots with the join broadcast and its task, is reachable with `--to` at once, receives later broadcasts, and survives a daemon restart.
+- [ ] A removed role's session stops, `--to` it is refused, broadcasts skip it, its history stays in the feed, its handle is not reused, and the removal survives a daemon restart.
+- [ ] The lead cannot be removed, and add and remove are refused on a mission that is not running.
+- [ ] Every join and leave on the feed is attributed to the person.
+- [ ] Live checks: the affected `MIS-*` cases in [`docs/tests/regression/missions.md`](../tests/regression/missions.md) plus new cases for a crewless start, an add and a remove, on macOS and Windows.
